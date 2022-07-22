@@ -59,6 +59,9 @@ torch._C._jit_override_can_fuse_on_cpu(False)
 torch._C._jit_override_can_fuse_on_gpu(False)
 torch._C._jit_set_bailout_depth(20)
 
+# torch.backends.cuda.matmul.allow_tf32 = False
+# torch.backends.cudnn.allow_tf32 = False
+
 # Track whether a SIGTERM (cluster time up) has been handled
 timeout_sent = False
 
@@ -250,10 +253,6 @@ def parse_arguments():
                         default=False,
                         action='store_true',
                         help="Whether to train with seq len 512")
-    parser.add_argument('--resume_phase2',
-                        default=False,
-                        action='store_true',
-                        help="Whether to resume training with seq len 512")
     parser.add_argument('--allreduce_post_accumulation',
                         default=False,
                         action='store_true',
@@ -287,6 +286,10 @@ def parse_arguments():
     parser.add_argument('--steps_this_run', type=int, default=-1,
                         help='If provided, only run this many steps before exiting')
     parser.add_argument("--profile",
+                        default=False,
+                        action='store_true',
+                        help="Whether to profile model.")
+    parser.add_argument("--profile_trace",
                         default=False,
                         action='store_true',
                         help="Whether to profile model.")
@@ -345,11 +348,6 @@ def setup_training(args):
     else:
         dllogger.init(backends=[])
 
-    dllogger.metadata("e2e_train_time", {"unit": "s"})
-    dllogger.metadata("training_sequences_per_second", {"unit": "sequences/s"})
-    dllogger.metadata("final_loss", {"unit": None})
-    dllogger.metadata("raw_train_time", {"unit": "s"})
-
     print("device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".format(
         device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
 
@@ -404,8 +402,6 @@ def prepare_model_and_optimizer(args, device, sequence_output_is_dense):
 
         if args.phase2 and not args.init_checkpoint:
             global_step -= args.phase1_end_step
-        if args.init_checkpoint:
-            args.resume_step = 0
         if is_main_process():
             print("resume step from ", args.resume_step)
 
@@ -438,13 +434,13 @@ def prepare_model_and_optimizer(args, device, sequence_output_is_dense):
     model.checkpoint_activations(args.checkpoint_activations)
 
     if args.resume_from_checkpoint:
-        # For phase2 from scratch, need to reset the learning rate and step count in the checkpoint. Else restore values in checkpoint.
-        if (args.phase2 and not args.resume_phase2) or args.init_checkpoint :
+        # For phase2, need to reset the learning rate and step count in the checkpoint
+        if args.phase2 or args.init_checkpoint :
             for group in checkpoint['optimizer']['param_groups'] :
                 group['step'].zero_()
                 group['lr'].fill_(args.learning_rate)
         else :
-            if 'grad_scaler' in checkpoint and (not args.phase2 or args.resume_phase2):
+            if 'grad_scaler' in checkpoint and not args.phase2:
                 grad_scaler.load_state_dict(checkpoint['grad_scaler'])
         optimizer.load_state_dict(checkpoint['optimizer'])  # , strict=False)
 
@@ -478,8 +474,8 @@ def prepare_model_and_optimizer(args, device, sequence_output_is_dense):
 
     criterion = BertPretrainingCriterion(config.vocab_size, sequence_output_is_dense=sequence_output_is_dense)
 
-    if (args.resume_from_checkpoint and not args.phase2) or (args.resume_phase2) or args.init_checkpoint:
-        start_epoch = checkpoint.get('epoch', 0)
+    if args.resume_from_checkpoint and args.init_checkpoint:
+        start_epoch = checkpoint['epoch']
     else:
         start_epoch = 0
 
@@ -517,6 +513,10 @@ def checkpoint_step(args, epoch, global_step, model, optimizer, grad_scaler, las
 
 def take_training_step(args, grad_scaler, model, criterion, batch, stats):
     with torch.cuda.amp.autocast(enabled=(args.fp16 and not args.allreduce_post_accumulation_fp16)) :
+        # print('autocast:',(args.fp16 and not args.allreduce_post_accumulation_fp16))
+        # print('yutao')
+        # print(model.module.graph_for(input_ids=batch['input_ids'], token_type_ids=batch['token_type_ids'], attention_mask=batch['attention_mask'], masked_lm_labels=batch['labels']))
+        # raise
         prediction_scores, seq_relationship_score = model(input_ids=batch['input_ids'], token_type_ids=batch['token_type_ids'], attention_mask=batch['attention_mask'], masked_lm_labels=batch['labels'])
         loss = criterion(prediction_scores, seq_relationship_score, batch['labels'], batch['next_sentence_labels'])
 
@@ -550,7 +550,7 @@ def main():
     dllogger.log(step="PARAMETER", data={"Config": [str(args)]})
 
     # Prepare optimizer
-    model, optimizer, grad_scaler, lr_scheduler, checkpoint, global_resume_step, criterion, epoch = prepare_model_and_optimizer(args, device, sequence_output_is_dense=not args.no_dense_sequence_output)
+    model, optimizer, grad_scaler, lr_scheduler, checkpoint, global_step, criterion, epoch = prepare_model_and_optimizer(args, device, sequence_output_is_dense=not args.no_dense_sequence_output)
     # Prepare the data loader.
     if is_main_process():
         tic = time.perf_counter()
@@ -657,6 +657,12 @@ def main():
 
     while True:
         for step, batch in enumerate(train_iter):
+            if batch['input_ids'].shape[1] != 512:
+                continue
+            print(batch['input_ids'].shape, step)
+            torch.cuda.synchronize()
+            st = time.time()
+
             # The first training step is 1 and not 0 when gradient accumulating
             # in order to avoid an optimizer step on the very first step
             stats.host_stat('model_step').add_(1)
@@ -674,21 +680,49 @@ def main():
                 else:
                     full_cudagraph.replay()
             else:
-                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                if args.profile:
+                    with torch.profiler.profile(
+                        activities=[
+                            # torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA,
+                        ],
+                        with_stack = False,
+                        record_shapes = False,
+                    ) as prof:
+                        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-                if args.allreduce_post_accumulation and grad_accumulation_step:
-                    with model.no_sync():
-                        take_training_step(args, grad_scaler, model, criterion, batch, stats)
+                        if args.allreduce_post_accumulation and grad_accumulation_step:
+                            with model.no_sync():
+                                take_training_step(args, grad_scaler, model, criterion, batch, stats)
+                        else:
+                            take_training_step(args, grad_scaler, model, criterion, batch, stats)
+
+                        if not grad_accumulation_step:
+                            take_optimizer_step(args, lr_scheduler, optimizer, grad_scaler, device, stats)
+                    time_info = str(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=-1))
+                    print(time_info)
+                    if args.profile_trace and step > 55:
+                        with open('./profile_trace.txt', 'w') as f:
+                            f.write(str(prof.events().table(sort_by="id", row_limit=-1)))
+                        prof.export_chrome_trace('./profile_trace.json')
+                        raise
                 else:
-                    take_training_step(args, grad_scaler, model, criterion, batch, stats)
+                    batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
-                if not grad_accumulation_step:
-                    take_optimizer_step(args, lr_scheduler, optimizer, grad_scaler, device, stats)
+                    if args.allreduce_post_accumulation and grad_accumulation_step:
+                        with model.no_sync():
+                            take_training_step(args, grad_scaler, model, criterion, batch, stats)
+                    else:
+                        take_training_step(args, grad_scaler, model, criterion, batch, stats)
+
+                    if not grad_accumulation_step:
+                        take_optimizer_step(args, lr_scheduler, optimizer, grad_scaler, device, stats)
+
 
             # Log Optimizer Step
             if (not grad_accumulation_step) or timeout_sent:
                 static_optimizer_step = stats.host_stat_value('model_step') // args.gradient_accumulation_steps
-                dynamic_optimizer_step = static_optimizer_step - int(stats.host_stat_value('skipped_optimizer_steps')) + global_resume_step
+                dynamic_optimizer_step = static_optimizer_step - int(stats.host_stat_value('skipped_optimizer_steps'))
                 no_log_steps = static_optimizer_step % args.log_freq
 
                 # Log Final Step (MAYBE)
@@ -698,9 +732,9 @@ def main():
                 # and others to not because they accidentally see a different value for `skipped_optimizer_steps`.
                 # In order to remove most device syncs, synchronizations only begin in the last few steps
                 # where the skipped step count matters.
-                if static_optimizer_step + global_resume_step >= args.steps_this_run or timeout_sent:
+                if static_optimizer_step >= args.steps_this_run or timeout_sent:
                     torch.cuda.synchronize()
-                    dynamic_optimizer_step = static_optimizer_step - int(stats.host_stat_value('skipped_optimizer_steps')) + global_resume_step
+                    dynamic_optimizer_step = static_optimizer_step - int(stats.host_stat_value('skipped_optimizer_steps'))
                     if dynamic_optimizer_step >= args.steps_this_run or timeout_sent:
                         train_time_raw = time.time() - raw_train_start
 
@@ -733,6 +767,8 @@ def main():
                     if not args.skip_checkpoint and (dynamic_optimizer_step % args.num_steps_per_checkpoint == 0):
                         checkpoint_step(args, epoch, dynamic_optimizer_step, model, optimizer, grad_scaler, most_recent_ckpts_paths)
 
+            torch.cuda.synchronize()
+            print(time.time() - st, step)
         epoch += 1
 
 
@@ -751,3 +787,4 @@ if __name__ == "__main__":
                                          "final_loss": stats.host_stat_value('average_loss'),
                                          "raw_train_time": train_time_raw })
     dllogger.flush()
+
